@@ -1,0 +1,1323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Algebra Arcade</title>
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+        }
+        #renderCanvas {
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+        }
+    </style>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+    <script src="https://preview.babylonjs.com/inspector/babylon.inspector.bundle.js"></script>
+    <script src="https://cdn.babylonjs.com/cannon.js"></script>
+    <script src="https://unpkg.com/earcut@2.2.4/dist/earcut.min.js"></script>
+    <script src="js/problemGenerator.js"></script>
+</head>
+<body>
+    <canvas id="renderCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById("renderCanvas");
+        const engine = new BABYLON.Engine(canvas, true);
+
+        // Initialize global variables
+        window.score = 0;  // Make score globally accessible
+        let isGeneratingProblem = false;
+        let lastProblemTime = 0;
+        let currentAnswer = null;
+        let checkedBalls = new Map();
+        let answerPlanes = new Map(); // Store answer planes for intersection checking
+        const PROBLEM_COOLDOWN = 1000;  // Changed from 2000 to 1000 to match new timing
+        let correctAnswers = 0;
+        let incorrectAnswers = 0;
+        let scoreboardMesh = null;
+        const problemGenerator = new ProblemGenerator(); // Create single shared instance
+
+        async function createScene() {
+            const scene = new BABYLON.Scene(engine);
+            
+            // Enable physics
+            scene.enablePhysics(new BABYLON.Vector3(0, -9.81, 0), new BABYLON.CannonJSPlugin());
+
+            // Initialize global state variables
+            let isGeneratingProblem = false;
+            let lastProblemTime = 0;
+            let currentAnswer = null;
+            let checkedBalls = new Map();
+            let answerPlanes = new Map(); // Store answer planes for intersection checking
+            const PROBLEM_COOLDOWN = 1000;  // Changed from 2000 to 1000 to match new timing
+            let score = window.score;  // Initialize local score from global score
+            let correctAnswers = 0;
+            let incorrectAnswers = 0;
+            let scoreboardMesh = null;
+            const problemGenerator = new ProblemGenerator(); // Create single shared instance
+
+            // Create scoreboard
+            async function updateScoreboard() {
+                // Calculate required width based on text content
+                const calculateTextWidth = (ctx, texts) => {
+                    let maxWidth = 0;
+                    texts.forEach(({text, font}) => {
+                        ctx.font = font;
+                        const width = ctx.measureText(text).width;
+                        maxWidth = Math.max(maxWidth, width);
+                    });
+                    return maxWidth;
+                };
+
+                // Create or update the dynamic texture first to measure text
+                const tempTexture = new BABYLON.DynamicTexture("tempTexture", { width: 1024, height: 256 }, scene);
+                const ctx = tempTexture.getContext();
+                
+                // Calculate stats once
+                const totalAttempts = correctAnswers + incorrectAnswers;
+                const accuracy = totalAttempts > 0 ? Math.round((correctAnswers / totalAttempts) * 100) : 0;
+                
+                // Prepare text content for measurement
+                const texts = [
+                    { text: `Level 1`, font: 'bold 72px Arial' }
+                ];
+
+                // Calculate required width with padding
+                const textWidth = calculateTextWidth(ctx, texts);
+                const requiredWidth = (textWidth / 512) + 0.4; // More padding for readability
+                tempTexture.dispose();
+
+                if (!scoreboardMesh) {
+                    // Create scoreboard plane
+                    scoreboardMesh = BABYLON.MeshBuilder.CreatePlane("scoreboard", {
+                        width: requiredWidth * 0.9,
+                        height: 0.12,
+                        sideOrientation: BABYLON.Mesh.DOUBLESIDE
+                    }, scene);
+
+                    // Position the scoreboard just below the problem display and centered with middle ring
+                    scoreboardMesh.position = new BABYLON.Vector3(0, 2.05, 2); // Centered at x=0
+                    scoreboardMesh.rotation = new BABYLON.Vector3(-Math.PI/6, 0, 0);
+                    
+                    // Create material for the scoreboard
+                    const scoreboardMaterial = new BABYLON.StandardMaterial("scoreboardMaterial", scene);
+                    scoreboardMaterial.diffuseColor = new BABYLON.Color3(1, 1, 1);
+                    scoreboardMaterial.specularColor = new BABYLON.Color3(0, 0, 0);
+                    scoreboardMaterial.emissiveColor = new BABYLON.Color3(1, 1, 1); // Increased emissive for better visibility
+                    scoreboardMaterial.useAlphaFromDiffuseTexture = true;
+                    scoreboardMaterial.backFaceCulling = false;
+                    scoreboardMesh.material = scoreboardMaterial;
+                } else {
+                    // Update scoreboard position while maintaining orientation
+                    scoreboardMesh.position = new BABYLON.Vector3(0, 2.05, 2);
+                    scoreboardMesh.rotation = new BABYLON.Vector3(-Math.PI/6, 0, 0);
+                }
+
+                // Create or update dynamic texture
+                if (!scoreboardMesh.material.diffuseTexture) {
+                    const texture = new BABYLON.DynamicTexture(
+                        "scoreboardTexture",
+                        {
+                            width: 1024,
+                            height: 64 // Increased height for better visibility
+                        },
+                        scene,
+                        true
+                    );
+                    texture.hasAlpha = true;
+                    scoreboardMesh.material.diffuseTexture = texture;
+                }
+
+                const texture = scoreboardMesh.material.diffuseTexture;
+                const textureCtx = texture.getContext();
+
+                // Helper function to draw outlined text
+                const drawOutlinedText = (text, x, y, font, fillColor) => {
+                    textureCtx.font = font;
+                    textureCtx.textAlign = "center";
+                    
+                    // Draw multiple outline layers for better visibility
+                    const outlineColor = 'rgba(0, 0, 0, 0.8)';
+                    const outlineWidth = 8;
+                    
+                    // Outer outline
+                    textureCtx.lineWidth = outlineWidth;
+                    textureCtx.strokeStyle = outlineColor;
+                    textureCtx.strokeText(text, x, y);
+                    
+                    // Inner outline
+                    textureCtx.lineWidth = outlineWidth / 2;
+                    textureCtx.strokeStyle = 'rgba(0, 0, 0, 0.9)';
+                    textureCtx.strokeText(text, x, y);
+                    
+                    // Main text
+                    textureCtx.fillStyle = fillColor;
+                    textureCtx.fillText(text, x, y);
+                };
+
+                // Clear the context with transparent black
+                textureCtx.clearRect(0, 0, 1024, 64);
+
+                // Constants for progress bar and background
+                const barHeight = 12; // Increased from 8 to 12 for thicker bar
+                const barY = 28; // Centered in the 64px height
+                const barRadius = barHeight / 1.9;
+                const padding = 14; // Increased padding for larger overall appearance
+
+                // Helper function to draw rounded rect if not already defined
+                const drawRoundedRect = (x, y, width, height, radius, fill = true) => {
+                    textureCtx.beginPath();
+                    textureCtx.moveTo(x + radius, y);
+                    textureCtx.lineTo(x + width - radius, y);
+                    textureCtx.quadraticCurveTo(x + width, y, x + width, y + radius);
+                    textureCtx.lineTo(x + width, y + height - radius);
+                    textureCtx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+                    textureCtx.lineTo(x + radius, y + height);
+                    textureCtx.quadraticCurveTo(x, y + height, x, y + height - radius);
+                    textureCtx.lineTo(x, y + radius);
+                    textureCtx.quadraticCurveTo(x, y, x + radius, y);
+                    if (fill) {
+                        textureCtx.fill();
+                    }
+                };
+
+                // Center the progress bar in the texture
+                const progressBarWidth = 900; // Increased from 784 for wider bar
+                const startX = (1024 - progressBarWidth) / 2; // Center in the 1024px width texture
+
+                // Fill background with semi-transparent white (now with larger corner radius for pill shape)
+                textureCtx.fillStyle = 'rgba(255, 255, 255, 0)';
+                const cornerRadius = barHeight + padding; // Increased radius for pill shape
+                drawRoundedRect(startX - padding, barY - padding, progressBarWidth + (padding * 2), barHeight + (padding * 2), cornerRadius);
+
+                // Draw progress bar background with pill shape
+                textureCtx.fillStyle = 'rgba(220, 220, 220, 0.5)';  // Made background more visible
+                drawRoundedRect(startX, barY, progressBarWidth, barHeight, barHeight / 2);
+
+                // Draw progress bar fill with pill shape
+                const progressWidth = Math.min(progressBarWidth * (Math.max(0, score) / 100), progressBarWidth);
+                const progressGradient = textureCtx.createLinearGradient(startX, 0, startX + progressBarWidth, 0);
+                progressGradient.addColorStop(0, 'rgba(0, 255, 0, 0.8)');  // Made fill more visible
+                progressGradient.addColorStop(1, 'rgba(0, 204, 0, 0.8)');
+                textureCtx.fillStyle = progressGradient;
+                
+                drawRoundedRect(startX, barY, progressWidth, barHeight, barHeight / 2);
+
+                // Force texture update
+                texture.update(true);  // Added force update parameter
+
+                // Create 3D text for "Level 1" if it doesn't exist
+                if (!this.levelTextMesh) {
+                    if (this.levelTextMesh) {
+                        this.levelTextMesh.dispose();
+                    }
+                    this.levelTextMesh = null;
+                }
+            }
+
+            // Set up global intersection observer
+            scene.registerBeforeRender(() => {
+                // Skip all checks if we're generating a problem or in cooldown
+                if (isGeneratingProblem) {
+                    return;
+                }
+                
+                const currentTime = Date.now();
+                if (currentTime - lastProblemTime <= PROBLEM_COOLDOWN) {
+                    return; // Still in cooldown, skip all checks
+                }
+
+                // Check all balls for collisions
+                scene.meshes.forEach(mesh => {
+                    if (mesh.name.startsWith("ball_")) {
+                        // Check for correct answer first
+                        const correctPlane = Array.from(answerPlanes.values())
+                            .find(plane => String(plane.answerValue) === String(currentAnswer));
+                        
+                        if (correctPlane && mesh.intersectsMesh(correctPlane, false)) {
+                            // Check if we've already processed this ball recently
+                            const lastPos = checkedBalls.get(mesh.name);
+                            if (lastPos && BABYLON.Vector3.Distance(lastPos, mesh.position) < 0.01) {
+                                return;
+                            }
+
+                            checkedBalls.set(mesh.name, mesh.position.clone());
+                            correctAnswers++;
+                            score = Math.min(100, score + 10);
+                            window.score = score;  // Update global score
+                            updateScoreboard();
+                            handleCorrectAnswer(scene);
+                            
+                            // Check for win condition
+                            if (score >= 100) {
+                                handleWinCondition(scene);
+                            }
+                            return; // Skip wrong answer checks if correct answer hit
+                        }
+
+                        // Check for wrong answers
+                        const wrongAnswerPlanes = Array.from(answerPlanes.values())
+                            .filter(plane => String(plane.answerValue) !== String(currentAnswer));
+                        
+                        wrongAnswerPlanes.forEach(plane => {
+                            if (mesh.intersectsMesh(plane, false)) {
+                                // Check if we've already processed this ball recently
+                                const lastPos = checkedBalls.get(mesh.name);
+                                if (lastPos && BABYLON.Vector3.Distance(lastPos, mesh.position) < 0.1) {
+                                    return;
+                                }
+
+                                // Update score - only deduct 5 points
+                                incorrectAnswers++;
+                                const deduction = 5;
+                                score = Math.max(0, score - deduction);
+                                window.score = score;  // Update global score
+                                
+                                // Make the wrong answer ring fall
+                                const ring = scene.meshes.find(m => 
+                                    m.name.startsWith("ring") && 
+                                    String(m.answerValue) === String(plane.answerValue)
+                                );
+                                
+                                if (ring) {
+                                    // Find the associated text
+                                    const text = scene.meshes.find(m => 
+                                        m.name.startsWith("answerText_") && 
+                                        Math.abs(m.position.x - ring.position.x) < 0.5 &&
+                                        Math.abs(m.position.y - ring.position.y) < 0.5 &&
+                                        Math.abs(m.position.z - ring.position.z) < 0.5
+                                    );
+
+                                    // Clean up collision cylinders first
+                                    if (ring.collisionMeshes) {
+                                        ring.collisionMeshes.forEach(mesh => {
+                                            if (mesh.physicsImpostor) {
+                                                mesh.physicsImpostor.dispose();
+                                            }
+                                            mesh.dispose();
+                                        });
+                                        ring.collisionMeshes = [];
+                                    }
+
+                                    // Apply physics to ring
+                                    ring.physicsImpostor = new BABYLON.PhysicsImpostor(
+                                        ring,
+                                        BABYLON.PhysicsImpostor.CylinderImpostor,
+                                        { 
+                                            mass: 1, 
+                                            restitution: 0,
+                                            friction: 0,
+                                            linearDamping: 0,
+                                            angularDamping: 0,
+                                            disableBidirectionalTransformation: true,
+                                            collisionsBitmask: 0
+                                        },
+                                        scene
+                                    );
+
+                                    ring.physicsImpostor.setLinearVelocity(
+                                        new BABYLON.Vector3(0, -2, 0)
+                                    );
+
+                                    const spinAxis = Math.random() < 0.5 ? 
+                                        new BABYLON.Vector3(1, 0, 0) :
+                                        new BABYLON.Vector3(0, 0, 1);
+                                    
+                                    ring.physicsImpostor.setAngularVelocity(
+                                        spinAxis.scale(5)
+                                    );
+
+                                    // Apply physics to text if it exists
+                                    if (text) {
+                                        text.physicsImpostor = new BABYLON.PhysicsImpostor(
+                                            text,
+                                            BABYLON.PhysicsImpostor.BoxImpostor,
+                                            { 
+                                                mass: 1,
+                                                restitution: 0,
+                                                friction: 0,
+                                                linearDamping: 0,
+                                                angularDamping: 0,
+                                                disableBidirectionalTransformation: true,
+                                                collisionsBitmask: 0
+                                            },
+                                            scene
+                                        );
+                                        
+                                        text.physicsImpostor.setLinearVelocity(
+                                            new BABYLON.Vector3(0, -2, 0)
+                                        );
+                                        
+                                        text.physicsImpostor.setAngularVelocity(
+                                            new BABYLON.Vector3(
+                                                Math.random() * 2 - 1,
+                                                Math.random() * 2 - 1,
+                                                Math.random() * 2 - 1
+                                            )
+                                        );
+                                    }
+
+                                    // Clean up after animation
+                                    setTimeout(() => {
+                                        if (ring && ring.physicsImpostor) {
+                                            ring.physicsImpostor.dispose();
+                                            ring.dispose();
+                                        }
+                                        if (text && text.physicsImpostor) {
+                                            text.physicsImpostor.dispose();
+                                            text.dispose();
+                                        }
+                                    }, 1000);
+                                }
+
+                                // Mark ball as checked and store its position
+                                checkedBalls.set(mesh.name, mesh.position.clone());
+                                
+                                // Update scoreboard
+                                updateScoreboard();
+                                return; // Exit after processing one wrong answer
+                            }
+                        });
+                    }
+                });
+            });
+
+            // Function to handle win condition
+            function handleWinCondition(scene) {
+                // Create win message plane with smaller size
+                const winPlane = BABYLON.MeshBuilder.CreatePlane("winPlane", { 
+                    width: 0.8,
+                    height: 0.4,
+                    sideOrientation: BABYLON.Mesh.DOUBLESIDE
+                }, scene);
+                winPlane.position = new BABYLON.Vector3(0, 1.6, 1.2);
+                winPlane.rotation = new BABYLON.Vector3(0, 0, 0);
+
+                // Create dynamic texture for win message
+                const winTexture = new BABYLON.DynamicTexture("winTexture", { width: 512, height: 256 }, scene, true);
+                const winMaterial = new BABYLON.StandardMaterial("winMaterial", scene);
+                winMaterial.diffuseTexture = winTexture;
+                winMaterial.useAlphaFromDiffuseTexture = true;
+                winMaterial.backFaceCulling = false;
+                winMaterial.disableLighting = true;
+                winMaterial.emissiveColor = BABYLON.Color3.White();
+                winMaterial.alpha = 1;
+                winMaterial.specularColor = new BABYLON.Color3(0, 0, 0);
+                winMaterial.ambientColor = new BABYLON.Color3(1, 1, 1);
+                winPlane.material = winMaterial;
+
+                // Draw win message with rounded corners
+                const textureContext = winTexture.getContext();
+                
+                // Clear the entire texture with transparent pixels
+                textureContext.clearRect(0, 0, 512, 256);
+
+                // Set up for high-quality rendering
+                textureContext.imageSmoothingEnabled = true;
+                textureContext.imageSmoothingQuality = 'high';
+
+                // Draw rounded rectangle background with pure white
+                const cornerRadius = 25;
+                textureContext.beginPath();
+                textureContext.moveTo(cornerRadius, 0);
+                textureContext.lineTo(512 - cornerRadius, 0);
+                textureContext.quadraticCurveTo(512, 0, 512, cornerRadius);
+                textureContext.lineTo(512, 256 - cornerRadius);
+                textureContext.quadraticCurveTo(512, 256, 512 - cornerRadius, 256);
+                textureContext.lineTo(cornerRadius, 256);
+                textureContext.quadraticCurveTo(0, 256, 0, 256 - cornerRadius);
+                textureContext.lineTo(0, cornerRadius);
+                textureContext.quadraticCurveTo(0, 0, cornerRadius, 0);
+                textureContext.closePath();
+
+                // Fill with pure white and set composite operation
+                textureContext.globalCompositeOperation = 'source-over';
+                textureContext.fillStyle = '#FFFFFF';
+                textureContext.fill();
+
+                // Draw text in black with anti-aliasing
+                textureContext.globalCompositeOperation = 'source-over';
+                textureContext.textAlign = 'center';
+                textureContext.textBaseline = 'middle';
+                
+                // Draw main text with shadow
+                textureContext.font = 'bold 48px Arial';
+                textureContext.fillStyle = '#000000';
+                textureContext.fillText("You Won!", 256, 100);
+
+                // Draw subtitle
+                textureContext.font = '24px Arial';
+                textureContext.fillText("Click to Play Again", 256, 160);
+
+                winTexture.update();
+
+                // Add click handler to restart game
+                const onClick = () => {
+                    try {
+                        // Remove click handler first to prevent multiple calls
+                        scene.onPointerObservable.removeCallback(onClick);
+
+                        // Reset game state
+                        score = 0;
+                        correctAnswers = 0;
+                        incorrectAnswers = 0;
+
+                        // Clean up all physics imposters first
+                        scene.meshes.forEach(mesh => {
+                            if (mesh.physicsImpostor) {
+                                mesh.physicsImpostor.dispose();
+                                mesh.physicsImpostor = null;
+                            }
+                        });
+
+                        // Clean up win message resources
+                        if (winPlane) {
+                            if (winPlane.material) {
+                                if (winPlane.material.diffuseTexture) {
+                                    winPlane.material.diffuseTexture.dispose();
+                                }
+                                winPlane.material.dispose();
+                            }
+                            winPlane.dispose();
+                        }
+
+                        // Clean up existing game objects and their resources
+                        const meshesToRemove = scene.meshes.filter(mesh => 
+                            mesh.name.startsWith("ball_") || 
+                            mesh.name.startsWith("ring") || 
+                            mesh.name.startsWith("answerText_") ||
+                            mesh.name.startsWith("collisionCylinder")
+                        );
+
+                        meshesToRemove.forEach(mesh => {
+                            try {
+                                if (mesh.physicsImpostor) {
+                                    mesh.physicsImpostor.dispose();
+                                    mesh.physicsImpostor = null;
+                                }
+                                if (mesh.material) {
+                                    if (mesh.material.diffuseTexture) {
+                                        mesh.material.diffuseTexture.dispose();
+                                    }
+                                    mesh.material.dispose();
+                                }
+                                mesh.dispose();
+                            } catch (error) {
+                                console.error("Error disposing mesh:", error);
+                            }
+                        });
+
+                        // Clear answer planes
+                        Array.from(answerPlanes.values()).forEach(plane => {
+                            try {
+                                if (plane.physicsImpostor) {
+                                    plane.physicsImpostor.dispose();
+                                    plane.physicsImpostor = null;
+                                }
+                                if (plane.material) {
+                                    if (plane.material.diffuseTexture) {
+                                        plane.material.diffuseTexture.dispose();
+                                    }
+                                    plane.material.dispose();
+                                }
+                                plane.dispose();
+                            } catch (error) {
+                                console.error("Error disposing plane:", error);
+                            }
+                        });
+                        answerPlanes.clear();
+                        checkedBalls.clear();
+
+                        // Clean up any remaining collision meshes
+                        scene.meshes.forEach(mesh => {
+                            if (mesh.name.includes("collision")) {
+                                if (mesh.physicsImpostor) {
+                                    mesh.physicsImpostor.dispose();
+                                    mesh.physicsImpostor = null;
+                                }
+                                mesh.dispose();
+                            }
+                        });
+
+                        // Update scoreboard after cleanup
+                        updateScoreboard();
+
+                        // Force a garbage collection
+                        engine.wipeCaches(true);
+                        
+                        // Small delay before generating new problem to ensure cleanup is complete
+                        setTimeout(() => {
+                            // Generate new problem
+                            problemGenerator.generateProblem().then(problemData => {
+                                const cleanData = {
+                                    problem: String(problemData.problem || ''),
+                                    answer: String(problemData.answer || ''),
+                                    options: Array.isArray(problemData.options) ?
+                                        problemData.options.map(String) :
+                                        ["1", "2", "3"]
+                                };
+                                
+                                if (!cleanData.options.includes(cleanData.answer)) {
+                                    const randomIndex = Math.floor(Math.random() * cleanData.options.length);
+                                    cleanData.options[randomIndex] = cleanData.answer;
+                                }
+                                
+                                currentAnswer = cleanData.answer;
+                                if (problemDisplay && problemDisplay.update) {
+                                    problemDisplay.update(cleanData.problem, cleanData.options, cleanData.answer);
+                                }
+                            }).catch(error => {
+                                console.error("Error generating new problem:", error);
+                            });
+                        }, 100);
+                    } catch (error) {
+                        console.error("Error in onClick handler:", error);
+                    }
+                };
+
+                // Add click handler to scene
+                scene.onPointerObservable.add(onClick, BABYLON.PointerEventTypes.POINTERDOWN);
+            }
+
+            // Function to handle correct answer selection
+            function handleCorrectAnswer(scene) {
+                // Prevent any further processing until next problem
+                isGeneratingProblem = true;
+                lastProblemTime = Date.now();
+
+                // Store which rings need to fall
+                const ringsToFall = scene.meshes
+                    .filter(mesh => mesh.name.startsWith("ring"))
+                    .map(ring => {
+                        const text = scene.meshes.find(m => 
+                            m.name.startsWith("answerText_") && 
+                            Math.abs(m.position.x - ring.position.x) < 0.5 &&  // Increased threshold
+                            Math.abs(m.position.y - ring.position.y) < 0.5 &&
+                            Math.abs(m.position.z - ring.position.z) < 0.5
+                        );
+                        if (text) {
+                            return {
+                                ring: ring,
+                                plane: answerPlanes.get(ring.answerValue),
+                                text: text
+                            };
+                        } else {
+                            return null;
+                        }
+                    })
+                    .filter(ringObj => ringObj && ringObj.plane && ringObj.plane.answerValue !== String(currentAnswer));
+
+                // Clean up collision detection for falling rings
+                ringsToFall.forEach(ringObj => {
+                    if (ringObj.ring.collisionMeshes) {
+                        ringObj.ring.collisionMeshes.forEach(mesh => {
+                            if (mesh.physicsImpostor) {
+                                mesh.physicsImpostor.dispose();
+                            }
+                            mesh.dispose();
+                        });
+                        ringObj.ring.collisionMeshes = [];
+                    }
+                    if (ringObj.plane.physicsImpostor) {
+                        ringObj.plane.physicsImpostor.dispose();
+                    }
+                    ringObj.plane.dispose();
+                });
+
+                // Make rings fall
+                ringsToFall.forEach(ringObj => {
+                    // Apply physics to ring
+                    ringObj.ring.physicsImpostor = new BABYLON.PhysicsImpostor(
+                        ringObj.ring,
+                        BABYLON.PhysicsImpostor.CylinderImpostor,
+                        { 
+                            mass: 1, 
+                            restitution: 0,
+                            friction: 0,
+                            linearDamping: 0,
+                            angularDamping: 0,
+                            disableBidirectionalTransformation: true,
+                            collisionsBitmask: 0
+                        },
+                        scene
+                    );
+
+                    ringObj.ring.physicsImpostor.setLinearVelocity(
+                        new BABYLON.Vector3(0, -2, 0)
+                    );
+
+                    const spinAxis = Math.random() < 0.5 ? 
+                        new BABYLON.Vector3(1, 0, 0) :
+                        new BABYLON.Vector3(0, 0, 1);
+                    
+                    ringObj.ring.physicsImpostor.setAngularVelocity(
+                        spinAxis.scale(5)
+                    );
+
+                    // Apply physics to text if it exists
+                    if (ringObj.text) {
+                        ringObj.text.physicsImpostor = new BABYLON.PhysicsImpostor(
+                            ringObj.text,
+                            BABYLON.PhysicsImpostor.BoxImpostor,
+                            { 
+                                mass: 1,
+                                restitution: 0,
+                                friction: 0,
+                                linearDamping: 0,
+                                angularDamping: 0,
+                                disableBidirectionalTransformation: true,
+                                collisionsBitmask: 0
+                            },
+                            scene
+                        );
+                        
+                        ringObj.text.physicsImpostor.setLinearVelocity(
+                            new BABYLON.Vector3(0, -2, 0)
+                        );
+                        
+                        ringObj.text.physicsImpostor.setAngularVelocity(
+                            new BABYLON.Vector3(
+                                Math.random() * 2 - 1,
+                                Math.random() * 2 - 1,
+                                Math.random() * 2 - 1
+                            )
+                        );
+                    }
+                });
+
+                // Clean up falling rings after animation and generate new problem
+                setTimeout(() => {
+                    ringsToFall.forEach(ringObj => {
+                        if (ringObj.ring && ringObj.ring.physicsImpostor) {
+                            ringObj.ring.physicsImpostor.dispose();
+                            ringObj.ring.dispose();
+                        }
+                        if (ringObj.text && ringObj.text.physicsImpostor) {
+                            ringObj.text.physicsImpostor.dispose();
+                            ringObj.text.dispose();
+                        }
+                    });
+
+                    // Generate new problem after cleanup
+                    problemGenerator.generateProblem().then(problemData => {
+                        const cleanData = {
+                            problem: String(problemData.problem || ''),
+                            answer: String(problemData.answer || ''),
+                            options: Array.isArray(problemData.options) ?
+                                problemData.options.map(String) :
+                                ["1", "2", "3"]
+                        };
+                        
+                        // Ensure answer is in the options
+                        if (!cleanData.options.includes(cleanData.answer)) {
+                            // Replace a random option with the answer
+                            const randomIndex = Math.floor(Math.random() * cleanData.options.length);
+                            cleanData.options[randomIndex] = cleanData.answer;
+                        }
+                        
+                        currentAnswer = cleanData.answer;
+                        
+                        if (problemDisplay && problemDisplay.update) {
+                            problemDisplay.update(cleanData.problem, cleanData.options, cleanData.answer);
+                            
+                            // Clean up all remaining balls after new problem is displayed
+                            scene.meshes
+                                .filter(m => m.name.startsWith("ball_"))
+                                .forEach(ball => {
+                                    if (ball.physicsImpostor) {
+                                        ball.physicsImpostor.dispose();
+                                    }
+                                    ball.dispose();
+                                });
+                            checkedBalls.clear();
+                        }
+                    }).catch(error => {
+                        console.error("Error generating new problem:", error);
+                    }).finally(() => {
+                        // Reset state after everything is done
+                        isGeneratingProblem = false;
+                        checkedBalls.clear();
+                    });
+                }, 1000);  // Changed from 2000 to 1000
+            }
+
+            // Camera setup
+            const camera = new BABYLON.FreeCamera("camera", new BABYLON.Vector3(0, 1.6, 0), scene);
+            camera.setTarget(BABYLON.Vector3.Forward());
+            camera.attachControl(canvas, true);
+
+            // Light setup
+            const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+            light.intensity = 0.9;
+
+            // XR setup
+            const xr = await scene.createDefaultXRExperienceAsync({
+                uiOptions: {
+                    sessionMode: "immersive-ar",
+                    referenceSpaceType: "local-floor"
+                }
+            });
+
+            // Enable passthrough
+            xr.baseExperience.featuresManager.enableFeature(BABYLON.WebXRFeatureName.BACKGROUND_REMOVER, "latest", {
+                environmentBlendMode: "additive"
+            });
+
+            // Create ball shooter
+            const ballShooter = new BallShooter(scene);
+
+            // Setup controller event handling
+            xr.input.onControllerAddedObservable.add((controller) => {
+                controller.onMotionControllerInitObservable.add((motionController) => {
+                    const xr_ids = motionController.getComponentIds();
+                    
+                    let triggerComponent = motionController.getComponent(xr_ids[0]); // xr-standard-trigger
+                    
+                    if (triggerComponent) {
+                        let canShoot = true;
+                        const shootCooldown = 100; // ms between shots
+                        
+                        triggerComponent.onButtonStateChangedObservable.add(() => {
+                            if (triggerComponent.pressed && canShoot) {
+                                canShoot = false;
+                                
+                                try {
+                                    const controllerPosition = controller.pointer.position.clone();
+                                    const controllerRotation = controller.pointer.rotationQuaternion;
+                                    
+                                    // Calculate forward direction based on controller rotation
+                                    const forward = new BABYLON.Vector3(0, 0, 1);
+                                    const direction = forward.rotateByQuaternionToRef(controllerRotation, new BABYLON.Vector3());
+                                    
+                                    // Ball spawn position
+                                    const spawnPosition = controllerPosition.add(direction.scale(0.01));
+                                    const ball = ballShooter.shoot(spawnPosition, direction);
+                                    
+                                    // Remove redundant physics impostor cleanup since it's a new ball
+                                    ball.physicsImpostor = new BABYLON.PhysicsImpostor(
+                                        ball, 
+                                        BABYLON.PhysicsImpostor.SphereImpostor, 
+                                        { 
+                                            mass: 1, 
+                                            restitution: 0.5,
+                                            friction: 0.5
+                                        }, 
+                                        scene
+                                    );
+                                    
+                                    // Apply shooting force
+                                    ball.physicsImpostor.setLinearVelocity(
+                                        direction.scale(ballShooter.shootingPower)
+                                    );
+                                    
+                                    // Reset shoot cooldown
+                                    setTimeout(() => {
+                                        canShoot = true;
+                                    }, shootCooldown);
+                                    
+                                } catch (error) {
+                                    console.error(error);
+                                    canShoot = true; // Reset on error
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+
+            // Create problem display
+            const problemDisplay = createProblemDisplay(scene, {
+                checkedBalls,
+                answerPlanes,
+                isGeneratingProblem: () => isGeneratingProblem,
+                setGeneratingProblem: (value) => { isGeneratingProblem = value },
+                currentAnswer: () => currentAnswer,
+                setCurrentAnswer: (value) => { currentAnswer = value }
+            });
+            
+            // Generate initial problem using the shared instance
+            problemGenerator.generateProblem().then(problemData => {
+                try {
+                    // Create a clean copy of the data with correct field mapping
+                    const cleanData = {
+                        problem: String(problemData.problem || ''),
+                        answer: String(problemData.answer || ''),
+                        options: Array.isArray(problemData.options) ?
+                            problemData.options.map(String) : 
+                            ["1", "2", "3"]
+                    };
+
+                    // Ensure answer is in the options
+                    if (!cleanData.options.includes(cleanData.answer)) {
+                        // Replace a random option with the answer
+                        const randomIndex = Math.floor(Math.random() * cleanData.options.length);
+                        cleanData.options[randomIndex] = cleanData.answer;
+                    }
+                    
+                    currentAnswer = cleanData.answer;
+                    
+                    // Update the display with the cleaned data
+                    problemDisplay.update(cleanData.problem, cleanData.options, cleanData.answer);
+                    
+                } catch (error) {
+                    console.error("Error in initial problem setup:", error);
+                    problemDisplay.update("2x + 3 = 7", ["1", "2", "3"], "2"); // Fallback problem
+                }
+            }).catch(error => {
+                console.error('Error generating initial problem:', error);
+                problemDisplay.update("2x + 3 = 7", ["1", "2", "3"], "2"); // Fallback problem
+            });
+
+            // Create initial scoreboard
+            updateScoreboard();
+
+            return scene;
+        }
+
+        function createProblemDisplay(scene, state) {
+            let textMesh = null;
+            let self = null;  // Store reference to the problem display object
+            let rings = [];  // Move rings array to be scoped within createProblemDisplay
+
+            function createRing(position, color, answerText) {
+                const outerRadius = 0.25;
+                const innerRadius = 0.20;
+                const ring = BABYLON.MeshBuilder.CreateTorus("ring", {
+                    thickness: outerRadius - innerRadius,
+                    diameter: outerRadius * 2,
+                    tessellation: 32
+                }, scene);
+
+                const ringMaterial = new BABYLON.StandardMaterial("ringMaterial", scene);
+                ringMaterial.emissiveColor = color;
+                ringMaterial.diffuseColor = color;
+                ringMaterial.alpha = 0.75;
+                ring.material = ringMaterial;
+                ring.position = position;
+                
+                // Rotate the ring to face the user (90 degrees around X axis)
+                ring.rotation = new BABYLON.Vector3(Math.PI / 2, 0, 0);
+
+                // Create collision cylinders arranged around the ring
+                const collisionMeshes = [];
+                
+                // Create cylinders evenly distributed around the ring
+                const numCylinders = 8; // Reduced from 16 to 8 cylinders
+                const radius = 0.25; // Match the ring's radius
+
+                for (let i = 0; i < numCylinders; i++) {
+                    const angle = (i / numCylinders) * Math.PI * 2;
+                    const xOffset = Math.cos(angle) * radius;
+                    const yOffset = Math.sin(angle) * radius;
+
+                    const cylinder = BABYLON.MeshBuilder.CreateCylinder("collisionCylinder", {
+                        height: 0.1,
+                        diameter: 0.1, // Increased diameter to compensate for fewer cylinders
+                    }, scene);
+
+                    cylinder.position = new BABYLON.Vector3(
+                        position.x + xOffset,
+                        position.y + yOffset,
+                        position.z
+                    );
+
+                    cylinder.rotation = new BABYLON.Vector3(0, 0, angle);
+                    
+                    // Create transparent material for cylinder
+                    const cylinderMaterial = new BABYLON.StandardMaterial("cylinderMaterial", scene);
+                    cylinderMaterial.alpha = 0;  // Make completely invisible
+                    cylinder.material = cylinderMaterial;
+                    
+                    // Optimize physics properties
+                    cylinder.physicsImpostor = new BABYLON.PhysicsImpostor(
+                        cylinder,
+                        BABYLON.PhysicsImpostor.CylinderImpostor,
+                        { 
+                            mass: 0, 
+                            restitution: 0.5, // Reduced from 0.7
+                            friction: 0.2,    // Reduced from 0.5
+                            sensor: false
+                        },
+                        scene
+                    );
+
+                    collisionMeshes.push(cylinder);
+                }
+
+                ring.collisionMeshes = collisionMeshes;
+
+                // Create answer text
+                const createAnswerText = async () => {
+                    try {
+                        const fontData = await (await fetch("./styles/Roboto Condensed Medium_Regular.json")).json();
+                        const text = BABYLON.MeshBuilder.CreateText(
+                            "answerText_" + Math.random(),
+                            answerText,
+                            fontData,
+                            {
+                                size: 0.2,
+                                resolution: 64,
+                                depth: 0.03,
+                            },
+                            scene
+                        );
+
+                        const textMaterial = new BABYLON.StandardMaterial("answerTextMaterial_" + Math.random(), scene);
+                        textMaterial.emissiveColor = new BABYLON.Color3(1, 1, 1);
+                        textMaterial.backFaceCulling = false;
+                        text.material = textMaterial;
+
+                        const ringDiameter = 0.5;
+                        text.position = position.clone();
+                        text.rotation.y = 0;
+
+                        const textBounds = text.getBoundingInfo().boundingBox;
+                        const textWidth = textBounds.maximumWorld.x - textBounds.minimumWorld.x;
+                        const textHeight = textBounds.maximumWorld.y - textBounds.minimumWorld.y;
+                        
+                        // Calculate dynamic offset based on text width
+                        const dynamicOffset = textWidth * 0.5; // Adjust this multiplier if needed
+                        text.position.x = position.x - (textWidth / 2) + dynamicOffset;
+                        text.position.y = position.y - (textHeight / 2);
+                        text.position.z += 0.01;
+
+                        text.isPickable = false;
+                        text.checkCollisions = false;
+
+                        return text;
+                    } catch (error) {
+                        console.error("Error creating answer text:", error);
+                        return null;
+                    }
+                };
+
+                // Create collision plane for answer selection
+                const plane = BABYLON.MeshBuilder.CreateBox("answerPlane", {
+                    width: 0.6,
+                    height: 0.6,
+                    depth: 0.5
+                }, scene);
+                plane.position = new BABYLON.Vector3(
+                    position.x,
+                    position.y,
+                    position.z + 0.25
+                );
+
+                // Create semi-transparent material for the plane
+                const planeMaterial = new BABYLON.StandardMaterial("planeMaterial", scene);
+                planeMaterial.diffuseColor = new BABYLON.Color3(1, 0, 0);
+                planeMaterial.alpha = 0;  // Make completely invisible
+                planeMaterial.backFaceCulling = false;
+                plane.material = planeMaterial;
+
+                // Store the answer value with both the ring and plane
+                ring.answerValue = answerText;
+                plane.answerValue = answerText;
+                plane.name = "answerPlane_" + answerText;
+
+                // Only add physics to wrong answer planes
+                const isCorrectAnswer = String(answerText) === String(state.currentAnswer());
+                if (!isCorrectAnswer) {
+                    // Add physics impostor to the plane with bounce properties
+                    plane.physicsImpostor = new BABYLON.PhysicsImpostor(
+                        plane,
+                        BABYLON.PhysicsImpostor.BoxImpostor,
+                        { 
+                            mass: 0,
+                            restitution: 0.7,
+                            friction: 0.1,
+                            disableBidirectionalTransformation: false
+                        },
+                        scene
+                    );
+
+                    // Keep the plane active for collisions even after triggering the fall animation
+                    plane.onCollideObservable = new BABYLON.Observable();
+                    plane.physicsImpostor.onCollideEvent = (collider, collidedWith) => {
+                        if (collidedWith.object.name.startsWith("ball_")) {
+                            // Let the collision physics handle the bounce naturally
+                            return true;
+                        }
+                    };
+                }
+
+                // Register the answer plane in the global map
+                state.answerPlanes.set(answerText, plane);
+
+                return {
+                    ring: ring,
+                    plane: plane,
+                    createText: createAnswerText,
+                    dispose: () => {
+                        // Remove from answer planes map
+                        state.answerPlanes.delete(answerText);
+                        
+                        if (plane.physicsImpostor) {
+                            plane.physicsImpostor.dispose();
+                        }
+                        plane.dispose();
+                        if (ring.physicsImpostor) {
+                            ring.physicsImpostor.dispose();
+                        }
+                        ring.collisionMeshes.forEach(mesh => {
+                            if (mesh.physicsImpostor) {
+                                mesh.physicsImpostor.dispose();
+                            }
+                            mesh.dispose();
+                        });
+                        ring.dispose();
+                    }
+                };
+            }
+
+            const display = {
+                update: async function(problemText, options = ["1", "2", "3"], answer) {
+                    try {
+                        // Reset state variables first
+                        state.setGeneratingProblem(false);
+                        state.checkedBalls.clear();
+                        state.answerPlanes.clear();
+                        state.setCurrentAnswer(String(answer)); // Ensure currentAnswer is updated and converted to string
+                        
+                        // Clean up existing physics before creating new objects
+                        rings.forEach(ring => {
+                            if (ring.ring && ring.ring.physicsImpostor) {
+                                ring.ring.physicsImpostor.dispose();
+                            }
+                            if (ring.text && ring.text.physicsImpostor) {
+                                ring.text.physicsImpostor.dispose();
+                            }
+                            if (ring.plane && ring.plane.physicsImpostor) {
+                                ring.plane.physicsImpostor.dispose();
+                            }
+                            if (ring.ring) ring.ring.dispose();
+                            if (ring.text) ring.text.dispose();
+                            if (ring.plane) ring.plane.dispose();
+                        });
+                        rings = [];  // Clear the local rings array
+
+                        // Clean up previous text mesh
+                        if (textMesh) {
+                            if (textMesh.physicsImpostor) {
+                                textMesh.physicsImpostor.dispose();
+                            }
+                            textMesh.dispose();
+                        }
+
+                        // Clean up any remaining balls
+                        scene.meshes
+                            .filter(m => m.name.startsWith("ball_"))
+                            .forEach(ball => {
+                                if (ball.physicsImpostor) {
+                                    ball.physicsImpostor.dispose();
+                                }
+                                ball.dispose();
+                            });
+
+                        // Update physics properties for all answer planes
+                        state.answerPlanes.forEach((plane, answerValue) => {
+                            const isCorrectAnswer = String(answerValue) === String(state.currentAnswer());
+                            plane.updatePhysics(isCorrectAnswer);
+                        });
+
+                        // Load font data
+                        const fontData = await (await fetch("./styles/Roboto Condensed Medium_Regular.json")).json();
+                        
+                        // Create 3D text
+                        textMesh = BABYLON.MeshBuilder.CreateText(
+                            "problemText",
+                            problemText,
+                            fontData,
+                            {
+                                size: 0.2,
+                                resolution: 64,
+                                depth: 0.05,
+                            },
+                            scene
+                        );
+
+                        // Create material for the text
+                        const textMaterial = new BABYLON.StandardMaterial("textMaterial", scene);
+                        textMaterial.emissiveColor = new BABYLON.Color3(1, 1, 1);
+                        textMaterial.backFaceCulling = false;
+                        textMesh.material = textMaterial;
+
+                        // First position at origin with no rotation to get true width
+                        textMesh.position = new BABYLON.Vector3(0, 0, 0);
+                        textMesh.rotation = new BABYLON.Vector3(0, 0, 0);
+                        
+                        // Get bounding box for true width
+                        const boundingInfo = textMesh.getBoundingInfo();
+                        const textWidth = boundingInfo.boundingBox.maximumWorld.x - boundingInfo.boundingBox.minimumWorld.x;
+                        
+                        // Calculate base offset based on text length
+                        const baseOffset = 0.35;  // Start with a larger base offset
+                        const lengthAdjustment = Math.max(0, (problemText.length - 7) * 0.03); 
+                        const finalOffset = baseOffset + lengthAdjustment;
+                        
+                        // Move to final position with proper centering
+                        textMesh.position = new BABYLON.Vector3(finalOffset, 2.13, 2);
+                        textMesh.rotation = new BABYLON.Vector3(-Math.PI/12, 0, 0);
+                        
+                        // Apply centering
+                        textMesh.position.x -= textWidth/2;
+
+                        // Create and position three rings below the text
+                        const ringY = textMesh.position.y - 0.5;
+                        const ringZ = textMesh.position.z;
+                        const ringSpacing = 0.8;
+                        
+                        // Calculate total width of all rings
+                        const totalRingWidth = ringSpacing * 2; // Space for 3 rings
+                        const startX = -totalRingWidth / 2; // Center the rings
+
+                        // Get three unique colors for the rings
+                        const colors = [
+                            new BABYLON.Color3(1, 0, 0),   // Red
+                            new BABYLON.Color3(0, 1, 0),   // Green
+                            new BABYLON.Color3(0, 0, 1),   // Blue
+                        ];
+
+                        // Create rings and their text
+                        for (let i = 0; i < 3; i++) {
+                            const position = new BABYLON.Vector3(
+                                startX + (i * ringSpacing),
+                                ringY,
+                                ringZ
+                            );
+                            
+                            const ringObj = createRing(position, colors[i], options[i]);
+                            // Create the text and store it
+                            const text = await ringObj.createText();
+                            rings.push({
+                                ring: ringObj.ring,
+                                plane: ringObj.plane,
+                                text: text
+                            });
+                        }
+                    } catch (error) {
+                        console.error("Error creating 3D text:", error);
+                    }
+                }
+            };
+
+            // Store reference to the display object
+            self = display;
+            return display;
+        }
+
+        createScene().then(scene => {
+            engine.runRenderLoop(() => {
+                scene.render();
+            });
+        });
+
+        window.addEventListener("resize", () => {
+            engine.resize();
+        });
+    </script>
+
+    <!-- Add BallShooter class definition -->
+    <script>
+        class BallShooter {
+            constructor(scene) {
+                this.scene = scene;
+                this.shootingPower = 10;
+                this.balls = new Set();
+                this.maxBalls = 20; // Maximum number of balls allowed
+                this.cleanupDistance = 10; // Distance at which balls get cleaned up
+
+                // Add cleanup check to scene's beforeRender
+                this.scene.registerBeforeRender(() => {
+                    this.cleanupBalls();
+                });
+            }
+
+            cleanupBalls() {
+                // Convert Set to Array for iteration since we'll be modifying the Set
+                Array.from(this.balls).forEach(ball => {
+                    // Clean up balls that are too far away
+                    if (ball && ball.position && (
+                        Math.abs(ball.position.y) > this.cleanupDistance ||
+                        Math.abs(ball.position.x) > this.cleanupDistance ||
+                        Math.abs(ball.position.z) > this.cleanupDistance
+                    )) {
+                        this.disposeBall(ball);
+                    }
+                });
+
+                // If we still have too many balls, remove the oldest ones
+                if (this.balls.size > this.maxBalls) {
+                    const ballsToRemove = Array.from(this.balls).slice(0, this.balls.size - this.maxBalls);
+                    ballsToRemove.forEach(ball => this.disposeBall(ball));
+                }
+            }
+
+            disposeBall(ball) {
+                if (ball) {
+                    if (ball.physicsImpostor) {
+                        ball.physicsImpostor.dispose();
+                    }
+                    ball.dispose();
+                    this.balls.delete(ball);
+                }
+            }
+
+            getRandomColor() {
+                const colors = [
+                    new BABYLON.Color3(1, 0, 0),   // Red
+                    new BABYLON.Color3(0, 1, 0),   // Green
+                    new BABYLON.Color3(0, 0, 1),   // Blue
+                    new BABYLON.Color3(1, 1, 0),   // Yellow
+                    new BABYLON.Color3(1, 0, 1),   // Purple
+                    new BABYLON.Color3(0, 1, 1),   // Cyan
+                ];
+                return colors[Math.floor(Math.random() * colors.length)];
+            }
+
+            shoot(position, direction) {
+                const ball = BABYLON.MeshBuilder.CreateSphere("ball_" + Math.random(), {
+                    diameter: 0.1,
+                    segments: 12  
+                }, this.scene);
+
+                ball.position = position.clone();
+
+                const ballMaterial = new BABYLON.StandardMaterial("ballMaterial", this.scene);
+                const randomColor = this.getRandomColor();
+                ballMaterial.emissiveColor = randomColor;
+                ballMaterial.diffuseColor = randomColor;
+                ball.material = ballMaterial;
+
+                // Add physics impostor
+                ball.physicsImpostor = new BABYLON.PhysicsImpostor(
+                    ball,
+                    BABYLON.PhysicsImpostor.SphereImpostor,
+                    {
+                        mass: 1,
+                        restitution: 0.5,
+                        friction: 0.5
+                    },
+                    this.scene
+                );
+
+                // Apply initial velocity in the shooting direction
+                const velocity = direction.scale(this.shootingPower);
+                ball.physicsImpostor.setLinearVelocity(velocity);
+
+                this.balls.add(ball);
+
+                return ball;
+            }
+        }
+    </script>
+</body>
+</html>

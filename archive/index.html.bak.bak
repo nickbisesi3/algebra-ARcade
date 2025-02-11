@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebXR Math Game Experience</title>
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+        }
+        #renderCanvas {
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+        }
+        #debugLayer {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.5);
+            color: white;
+            padding: 10px;
+            font-family: monospace;
+            display: none;
+        }
+    </style>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+    <script src="https://preview.babylonjs.com/inspector/babylon.inspector.bundle.js"></script>
+    <script src="https://cdn.babylonjs.com/cannon.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <script src="ballShooter.js"></script>
+    <script src="problemGenerator.js"></script>
+</head>
+<body>
+    <canvas id="renderCanvas"></canvas>
+    <div id="debugLayer"></div>
+
+    <script>
+        let problemGenerator;
+        let currentProblem;
+        let score = 0;
+
+        // Initialize Tone.js synths
+        const correctSound = new Tone.Synth({
+            oscillator: {
+                type: "sine"
+            },
+            envelope: {
+                attack: 0.01,
+                decay: 0.1,
+                sustain: 0.1,
+                release: 0.1
+            }
+        }).toDestination();
+
+        const wrongSound = new Tone.Synth({
+            oscillator: {
+                type: "square"
+            },
+            envelope: {
+                attack: 0.01,
+                decay: 0.2,
+                sustain: 0.1,
+                release: 0.2
+            }
+        }).toDestination();
+
+        // Function to play correct answer sound
+        function playCorrectSound() {
+            Tone.start();
+            correctSound.triggerAttackRelease("C5", "8n");
+        }
+
+        // Function to play wrong answer sound
+        function playWrongSound() {
+            Tone.start();
+            wrongSound.triggerAttackRelease("E4", "8n");
+        }
+
+        const canvas = document.getElementById("renderCanvas");
+        const engine = new BABYLON.Engine(canvas, true);
+        const debugLayer = document.getElementById("debugLayer");
+
+        // Initialize game on window load
+        window.onload = () => {
+            problemGenerator = new ProblemGenerator();
+            createScene().then(scene => {
+                engine.runRenderLoop(() => {
+                    scene.render();
+                });
+            });
+        };
+        //Debugging function
+        function debug(message) {
+            console.log(message);
+            debugLayer.style.display = "block";
+            debugLayer.innerHTML += message + "<br>";
+        }
+
+        async function generateNewProblem(scene, problemDisplay, answerSpheres) {
+            try {
+                currentProblem = await problemGenerator.generateProblem();
+                problemDisplay.update(currentProblem.problem);
+                
+                const answers = [currentProblem.correct_answer, ...currentProblem.distractors];
+                const shuffledAnswers = answers.sort(() => Math.random() - 0.5);
+                
+                answerSpheres.forEach((sphereObj, index) => {
+                    sphereObj.answer = shuffledAnswers[index];
+                    sphereObj.updateLabel(shuffledAnswers[index]);
+                    sphereObj.sphere.metadata = {
+                        isCorrect: shuffledAnswers[index] === currentProblem.correct_answer
+                    };
+                });
+            } catch (error) {
+                debug(`Error generating new problem: ${error.message}`);
+            }
+        }
+
+        async function createScene() {
+            const scene = new BABYLON.Scene(engine);
+            
+            // Enable physics
+            scene.enablePhysics(new BABYLON.Vector3(0, -9.81, 0), new BABYLON.CannonJSPlugin());
+
+            // Camera setup
+            const camera = new BABYLON.FreeCamera("camera", new BABYLON.Vector3(0, 1.6, 0), scene);
+            camera.setTarget(BABYLON.Vector3.Forward());
+            camera.attachControl(canvas, true);
+
+            // Light setup
+            const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+            light.intensity = 0.7;
+
+            // XR setup
+            const xr = await scene.createDefaultXRExperienceAsync({
+                uiOptions: {
+                    sessionMode: "immersive-ar",
+                    referenceSpaceType: "local-floor"
+                }
+            });
+
+            xr.baseExperience.featuresManager.enableFeature(BABYLON.WebXRFeatureName.BACKGROUND_REMOVER, "latest", {
+                environmentBlendMode: "additive"
+            });
+
+            debug("XR experience and passthrough set up");
+
+            // Create ball shooter
+            const ballShooter = new BallShooter(scene);
+
+            // Setup controller event handling
+            xr.input.onControllerAddedObservable.add((controller) => {
+                debug("Controller added");
+                
+                controller.onMotionControllerInitObservable.add((motionController) => {
+                    debug(`Controller initialized - handedness: ${motionController.handedness}`);
+                    
+                    const xr_ids = motionController.getComponentIds();
+                    debug(`Controller components: ${xr_ids.join(', ')}`);
+                    
+                    let triggerComponent = motionController.getComponent(xr_ids[0]); // xr-standard-trigger
+                    
+                    if (triggerComponent) {
+                        debug("Trigger component found");
+                        
+                        // Add debounce to prevent rapid-fire
+                        let canShoot = true;
+                        const shootCooldown = 100; // ms between shots
+                        
+                        triggerComponent.onButtonStateChangedObservable.add(() => {
+                            if (triggerComponent.pressed && canShoot) {
+                                canShoot = false;
+                                
+                                try {
+                                    debug("Trigger pressed - shooting ball");
+                                    
+                                    // Get controller position and direction
+                                    const controllerPosition = controller.pointer.position.clone();
+                                    const controllerRotation = controller.pointer.rotationQuaternion;
+                                    
+                                    // Calculate forward direction based on controller rotation
+                                    const forward = new BABYLON.Vector3(0, 0, 1);
+                                    const direction = forward.rotateByQuaternionToRef(controllerRotation, new BABYLON.Vector3());
+                                    direction.normalize(); // Ensure direction is normalized
+                                    
+                                    // Ball spawn position
+                                    const spawnPosition = controllerPosition.add(direction.scale(0.01));
+                                    const ball = ballShooter.shoot(spawnPosition);
+                                    
+                                    // Create physics impostor
+                                    ball.physicsImpostor = new BABYLON.PhysicsImpostor(
+                                        ball, 
+                                        BABYLON.PhysicsImpostor.SphereImpostor, 
+                                        { 
+                                            mass: 1, 
+                                            restitution: 0.5,
+                                            friction: 0.2,
+                                            ignoreParent: true
+                                        }, 
+                                        scene
+                                    );
+                                    
+                                    // Enable collision callbacks
+                                    ball.physicsImpostor.onCollideEvent = (collider, collidedWith) => {
+                                        if (collidedWith.object.name.includes('answerSphere')) {
+                                            debug("Ball collision detected with answer sphere");
+                                            // Trigger the collision handling on the sphere
+                                            const sphereObj = answerSpheres.find(s => s.sphere === collidedWith.object);
+                                            if (sphereObj) {
+                                                const isCorrect = sphereObj.sphere.metadata.isCorrect;
+                                                if (isCorrect) {
+                                                    sphereObj.sphere.material.emissiveColor = new BABYLON.Color3(0, 1, 0);
+                                                    score += 10;
+                                                    debug(`Correct! Score: ${score}`);
+                                                    playCorrectSound();
+
+                                                    // Update physics properties to make the sphere fall
+                                                    sphereObj.sphere.physicsImpostor.dispose();
+                                                    sphereObj.sphere.physicsImpostor = new BABYLON.PhysicsImpostor(
+                                                        sphereObj.sphere,
+                                                        BABYLON.PhysicsImpostor.SphereImpostor,
+                                                        { mass: 1, restitution: 0.5, friction: 0.2 },
+                                                        scene
+                                                    );
+
+                                                    // Apply a small impulse from the ball's collision
+                                                    const ballVelocity = ball.physicsImpostor.getLinearVelocity();
+                                                    sphereObj.sphere.physicsImpostor.applyImpulse(
+                                                        ballVelocity.scale(0.5),
+                                                        sphereObj.sphere.getAbsolutePosition()
+                                                    );
+
+                                                    // Generate new problem after the sphere starts falling
+                                                    setTimeout(async () => {
+                                                        await generateNewProblem(scene, problemDisplay, answerSpheres);
+                                                        // Reset sphere position and physics
+                                                        sphereObj.sphere.position = sphereObj.originalPosition.clone();
+                                                        sphereObj.sphere.physicsImpostor.dispose();
+                                                        sphereObj.sphere.physicsImpostor = new BABYLON.PhysicsImpostor(
+                                                            sphereObj.sphere,
+                                                            BABYLON.PhysicsImpostor.SphereImpostor,
+                                                            { mass: 0, restitution: 0.9 },
+                                                            scene
+                                                        );
+                                                        sphereObj.sphere.material.emissiveColor = new BABYLON.Color3(0.2, 0.6, 1);
+                                                    }, 1000);
+                                                } else {
+                                                    sphereObj.sphere.material.emissiveColor = new BABYLON.Color3(1, 0, 0);
+                                                    score = Math.max(0, score - 5);
+                                                    debug(`Incorrect! Score: ${score}`);
+                                                    playWrongSound();
+                                                    setTimeout(() => {
+                                                        sphereObj.sphere.material.emissiveColor = new BABYLON.Color3(0.2, 0.6, 1);
+                                                    }, 500);
+                                                }
+                                            }
+                                        }
+                                    };
+                                    
+                                    // Apply shooting force directly
+                                    const shootingVelocity = direction.scale(ballShooter.shootingPower);
+                                    ball.physicsImpostor.setLinearVelocity(shootingVelocity);
+                                    
+                                    debug(`Ball shot with velocity: ${shootingVelocity.length()}`);
+                                    
+                                    // Cleanup ball and its impostor after 3 seconds
+                                    setTimeout(() => {
+                                        if (ball && ball.physicsImpostor) {
+                                            ball.physicsImpostor.dispose();
+                                            ball.dispose();
+                                        }
+                                    }, 3000);
+                                    
+                                    // Reset shoot cooldown
+                                    setTimeout(() => {
+                                        canShoot = true;
+                                    }, shootCooldown);
+                                    
+                                } catch (error) {
+                                    debug(`Error shooting ball: ${error.message}`);
+                                    console.error(error);
+                                    canShoot = true;
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+
+            // Create problem display
+            const problemDisplay = createProblemDisplay(scene);
+            const answerSpheres = createAnswerSpheres(scene, ["", "", ""]);
+            await generateNewProblem(scene, problemDisplay, answerSpheres);
+
+            // Add physics impostor to answer spheres
+            answerSpheres.forEach(sphereObj => {
+                sphereObj.sphere.physicsImpostor = new BABYLON.PhysicsImpostor(
+                    sphereObj.sphere,
+                    BABYLON.PhysicsImpostor.SphereImpostor,
+                    { mass: 0, restitution: 0.9 },
+                    scene
+                );
+                
+                // Add collision detection
+                sphereObj.sphere.physicsImpostor.registerOnPhysicsCollide(
+                    BABYLON.PhysicsImpostor.SphereImpostor,
+                    (collider) => {
+                        debug(`Collision with answer: ${sphereObj.answer}`);
+                        const isCorrect = sphereObj.sphere.metadata.isCorrect;
+                        
+                        if (isCorrect) {
+                            // Correct answer handling
+                            sphereObj.sphere.material.emissiveColor = new BABYLON.Color3(0, 1, 0); // Green
+                            score += 10;
+                            debug(`Score: ${score}`);
+                            playCorrectSound();
+                            
+                            // Generate new problem after a delay
+                            setTimeout(async () => {
+                                await generateNewProblem(scene, problemDisplay, answerSpheres);
+                                sphereObj.sphere.material.emissiveColor = new BABYLON.Color3(0.2, 0.6, 1);
+                            }, 1000);
+                        } else {
+                            // Incorrect answer handling
+                            sphereObj.sphere.material.emissiveColor = new BABYLON.Color3(1, 0, 0); // Red
+                            score = Math.max(0, score - 5);
+                            debug(`Score: ${score}`);
+                            playWrongSound();
+                            
+                            // Reset color after feedback
+                            setTimeout(() => {
+                                sphereObj.sphere.material.emissiveColor = new BABYLON.Color3(0.2, 0.6, 1);
+                            }, 500);
+                        }
+                    }
+                );
+            });
+
+            return scene;
+        }
+
+        function createProblemDisplay(scene) {
+            const plane = BABYLON.MeshBuilder.CreatePlane("problemPlane", { width: 2, height: 0.5 }, scene);
+            plane.position = new BABYLON.Vector3(0, 2.15, 2);
+
+            const dynamicTexture = new BABYLON.DynamicTexture("DynamicTexture", { width: 512, height: 256 }, scene);
+            const mat = new BABYLON.StandardMaterial("mat", scene);
+            mat.diffuseTexture = dynamicTexture;
+            mat.emissiveColor = new BABYLON.Color3(1, 1, 1); // White text for visibility
+            mat.backFaceCulling = false; // Make text visible from both sides
+            plane.material = mat;
+
+            return {
+                plane: plane,
+                texture: dynamicTexture,
+                update: function(problemText) {
+                    const ctx = dynamicTexture.getContext();
+                    ctx.clearRect(0, 0, 512, 256);
+                    ctx.font = "bold 72px Arial";
+                    ctx.fillStyle = "white";
+                    ctx.textAlign = "center";
+                    ctx.fillText(problemText, 256, 128);
+                    dynamicTexture.update();
+                }
+            };
+        }
+
+        function createAnswerSpheres(scene, answers) {
+            const spheres = [];
+            const spacing = 0.7;
+            const totalWidth = (answers.length - 1) * spacing;
+            const startX = -totalWidth / 2;
+
+            for (let i = 0; i < answers.length; i++) {
+                const sphere = BABYLON.MeshBuilder.CreateSphere(`answerSphere_${i}`, { diameter: 0.3 }, scene);
+                sphere.position = new BABYLON.Vector3(startX + i * spacing, 1.3, 2);
+
+                // Create material for the sphere
+                const sphereMaterial = new BABYLON.StandardMaterial(`sphereMat_${sphere.name}`, scene);
+                sphereMaterial.emissiveColor = new BABYLON.Color3(0.2, 0.6, 1); // Light blue color
+                sphere.material = sphereMaterial;
+
+                const labelPlane = BABYLON.MeshBuilder.CreatePlane(`label_${i}`, { width: 0.4, height: 0.25 }, scene);
+                labelPlane.parent = sphere;
+                labelPlane.position.y = 0.3;
+
+                const labelTexture = new BABYLON.DynamicTexture(`labelTexture_${i}`, { width: 256, height: 128 }, scene);
+                const labelMat = new BABYLON.StandardMaterial(`labelMat_${i}`, scene);
+                labelMat.diffuseTexture = labelTexture;
+                labelMat.emissiveColor = new BABYLON.Color3(1, 1, 1);
+                labelMat.backFaceCulling = false;
+                labelPlane.material = labelMat;
+
+                const ctx = labelTexture.getContext();
+                ctx.clearRect(0, 0, 256, 128);
+                ctx.font = "bold 36px Arial";
+                ctx.fillStyle = "white";
+                ctx.textAlign = "center";
+                ctx.fillText(answers[i], 128, 64);
+                labelTexture.update();
+
+                spheres.push({ 
+                    sphere: sphere, 
+                    answer: answers[i],
+                    originalPosition: sphere.position.clone(),
+                    updateLabel: function(newAnswer) {
+                        ctx.clearRect(0, 0, 256, 128);
+                        ctx.fillText(newAnswer, 128, 64);
+                        labelTexture.update();
+                    }
+                });
+            }
+            return spheres;
+        }
+
+        createScene().then(scene => {
+            engine.runRenderLoop(() => {
+                scene.render();
+            });
+        });
+
+        window.addEventListener("resize", () => {
+            engine.resize();
+        });
+    </script>
+</body>
+</html>
